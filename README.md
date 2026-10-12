@@ -50,26 +50,55 @@ Type `/graphify` in your AI coding assistant and it maps your entire project (co
 > [!TIP]
 > **XIOS/3 Edition**: This fork includes native AST extraction for **XIOS/3 applications** (`.xml` processes, `.xml` views, `index.xml` application manifest, `types.xml`, and `.xsl` component skins).
 
-### Quickstart (XIOS/3 Edition)
+## Claude Code Quickstart (XIOS/3 Edition)
+
+Get it running with **Claude Code** so you can type `/graphify .` in any XIOS project:
+
+### 1. Install `graphify-xios`
+
+Clone this repo and install in editable mode:
 
 ```bash
-# 1. Clone & install in editable mode
 git clone https://github.com/TedBoman/graphify-xios.git
 cd graphify-xios
 pip install -e .
-
-# 2. Extract your XIOS project (fully local AST, zero API token cost)
-graphify extract /path/to/xios-project --code-only
-
-# 3. Detect architectural communities and generate interactive report
-graphify cluster-only /path/to/xios-project
 ```
 
-Once built, open `graphify-out/graph.html` in your browser to interactively explore your XIOS views, processes, triggers, and operations, or query the graph:
+### 2. Register the skill with Claude Code
+
+Run this once:
 
 ```bash
-graphify query "your concept or component" --graph /path/to/xios-project/graphify-out/graph.json
+graphify install
 ```
+
+This installs the skill to `~/.claude/skills/graphify/SKILL.md` so Claude Code recognizes the `/graphify` slash command.
+
+### 3. Open Claude Code in your XIOS project
+
+Navigate to your XIOS project folder and launch Claude:
+
+```bash
+cd /path/to/your/xios-project
+claude
+```
+
+Then simply type:
+
+```
+/graphify .
+```
+
+Claude Code will automatically detect and parse all your XIOS XML processes, views, triggers, operations, data bindings, and XSL skins, outputting:
+
+```
+graphify-out/
+├── graph.html       interactive visualization — click nodes, inspect triggers, steps & views
+├── GRAPH_REPORT.md  architectural analysis: god nodes, communities, surprising connections
+└── graph.json       the full queryable knowledge graph
+```
+
+From then on, Claude Code will automatically consult the graph to answer questions about your XIOS codebase without needing to grep raw files!
 
 ---
 
