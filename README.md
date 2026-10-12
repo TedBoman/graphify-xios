@@ -129,10 +129,10 @@ your-project/
   ```bash
   graphify claude install
   ```
-  This creates `CLAUDE.md` and registers `.claude/settings.json` hooks in one go.
+  This creates `CLAUDE.md` and registers `.claude/settings.json` hooks in one go. *(If you already have an existing `CLAUDE.md`, it does **not** overwrite it—it safely appends the `## graphify` section to the bottom, preserving all your existing project rules).*
 
 * **Option B (Manual)**:
-  Create a file named `CLAUDE.md` in your project root with this content:
+  If `CLAUDE.md` doesn't exist, create it in your project root. If you already have one, simply append this block to the bottom of the file:
   ```markdown
   ## graphify
 
