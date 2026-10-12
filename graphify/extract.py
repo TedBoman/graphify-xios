@@ -198,7 +198,7 @@ def _safe_extract(
     extractor: Callable, path: Path, *, scan_root: Path | None = None
 ) -> dict:
     try:
-        if extractor is extract_python:
+        if extractor in (extract_python, extract_xios):
             return extractor(path, root=scan_root)
         return extractor(path)
     except RecursionError:
