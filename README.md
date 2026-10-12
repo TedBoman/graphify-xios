@@ -47,7 +47,33 @@ Type `/graphify` in your AI coding assistant and it maps your entire project (co
   <em>The FastAPI codebase mapped by graphify. Every node is a concept, colors are detected communities, and the whole thing is clickable in graph.html.</em>
 </p>
 
-**Get started** (30 seconds):
+> [!TIP]
+> **XIOS/3 Edition**: This fork includes native AST extraction for **XIOS/3 applications** (`.xml` processes, `.xml` views, `index.xml` application manifest, `types.xml`, and `.xsl` component skins).
+
+### Quickstart (XIOS/3 Edition)
+
+```bash
+# 1. Clone & install in editable mode
+git clone https://github.com/TedBoman/graphify-xios.git
+cd graphify-xios
+pip install -e .
+
+# 2. Extract your XIOS project (fully local AST, zero API token cost)
+graphify extract /path/to/xios-project --code-only
+
+# 3. Detect architectural communities and generate interactive report
+graphify cluster-only /path/to/xios-project
+```
+
+Once built, open `graphify-out/graph.html` in your browser to interactively explore your XIOS views, processes, triggers, and operations, or query the graph:
+
+```bash
+graphify query "your concept or component" --graph /path/to/xios-project/graphify-out/graph.json
+```
+
+---
+
+**Standard Graphify Get started** (30 seconds):
 
 ```bash
 uv tool install graphifyy      # install the CLI (or: pipx install graphifyy)
@@ -344,7 +370,7 @@ Both encourage scoped graph queries before broad source searches. Choose the ins
 
 ## What files it handles
 
-graphify parses ~40 programming languages locally with tree-sitter AST, and maps docs, PDFs, images, and audio/video through an optional semantic pass. Full list: **[Supported inputs](https://docs.graphify.com/concepts/supported-inputs)**.
+graphify parses ~40 programming languages locally with tree-sitter AST, plus **XIOS/3 XML views, processes, manifests, and XSL skins**, and maps docs, PDFs, images, and audio/video through an optional semantic pass. Full list: **[Supported inputs](https://docs.graphify.com/concepts/supported-inputs)**.
 
 ---
 
