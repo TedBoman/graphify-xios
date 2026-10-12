@@ -37,6 +37,7 @@ from graphify.extractors.sql import extract_sql
 from graphify.extractors.terraform import extract_terraform
 from graphify.extractors.verilog import extract_verilog
 from graphify.extractors.vbnet import extract_vbnet
+from graphify.extractors.xios import extract_xios, extract_xios_xsl
 from graphify.extractors.zig import extract_zig
 
 LANGUAGE_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
@@ -72,5 +73,7 @@ LANGUAGE_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     "terraform": extract_terraform,
     "verilog": extract_verilog,
     "vbnet": extract_vbnet,
+    "xios": extract_xios,
+    "xios_xsl": extract_xios_xsl,
     "zig": extract_zig,
 }

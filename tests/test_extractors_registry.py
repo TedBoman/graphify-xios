@@ -42,3 +42,13 @@ def test_terraform_migrated():
 
     assert facade.extract_terraform is extract_terraform
     assert LANGUAGE_EXTRACTORS["terraform"] is extract_terraform
+
+
+def test_xios_migrated():
+    from graphify.extractors.xios import extract_xios, extract_xios_xsl
+
+    assert facade.extract_xios is extract_xios
+    assert facade.extract_xios_xsl is extract_xios_xsl
+    assert LANGUAGE_EXTRACTORS["xios"] is extract_xios
+    assert LANGUAGE_EXTRACTORS["xios_xsl"] is extract_xios_xsl
+
