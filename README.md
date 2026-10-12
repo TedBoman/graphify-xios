@@ -112,7 +112,17 @@ From then on, Claude Code will automatically consult the graph to answer questio
 
 #### Where `CLAUDE.md` Lives & How to Create It
 
-`CLAUDE.md` sits in the **root directory of your project** (e.g. `R:\aimcount\CLAUDE.md`, right beside `graphify-out/`).
+`CLAUDE.md` sits directly in the **root directory of your project**, right beside `graphify-out/`:
+
+```
+your-project/
+├── CLAUDE.md          <-- Put it right here!
+├── index.xml
+├── views/
+├── processes/
+├── components/
+└── graphify-out/
+```
 
 * **Option A (Automatic - Recommended)**:
   Open a terminal inside your project folder and run:
