@@ -468,3 +468,88 @@ def test_xios_process_operations_and_open_bind_paths():
         assert len(save_edges) == 1
         assert "output.xml" in save_edges[0]["target_file"]
 
+
+def test_xios_boot_and_published_application_linking():
+    """Verify boot startup/system links, canonical node IDs, unnamed custom components, and published apps."""
+    index_html = """<!DOCTYPE html>
+<html>
+<head>
+  <script type="text/javascript">
+    window.boot = {
+        startup: "host://service/database.xml",
+        system: "host://config/system_cbe.xml"
+    };
+  </script>
+</head>
+<body></body>
+</html>"""
+
+    view_xml = """<?xml version="1.0" encoding="utf-8"?>
+<view name="PipelineView">
+  <pipeline src="host://data/pipe.xml"/>
+</view>"""
+
+    proc_xml = """<?xml version="1.0" encoding="utf-8"?>
+<process name="ProcWithAlias">
+  <step id="s1">
+    <alias name="op" value="host://operations/PO_track.js"/>
+  </step>
+</process>"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "index.html").write_text(index_html, encoding="utf-8")
+
+        # System configs
+        (root / "service").mkdir(parents=True)
+        (root / "service" / "database.xml").write_text("<application name='DB'/>", encoding="utf-8")
+        (root / "config").mkdir(parents=True)
+        (root / "config" / "system_cbe.xml").write_text("<system name='Sys'/>", encoding="utf-8")
+        (root / "operations").mkdir(parents=True)
+        (root / "operations" / "PO_track.js").write_text("console.log(1);", encoding="utf-8")
+
+        # Published app
+        (root / "published").mkdir(parents=True)
+        (root / "published" / "index.html").write_text("<!DOCTYPE html><html></html>", encoding="utf-8")
+        (root / "published" / "published.xml").write_text("<application name='Pub'/>", encoding="utf-8")
+
+        # View & Process
+        v_path = root / "service" / "views" / "pipe.xml"
+        v_path.parent.mkdir(parents=True)
+        v_path.write_text(view_xml, encoding="utf-8")
+
+        p_path = root / "service" / "processes" / "proc.xml"
+        p_path.parent.mkdir(parents=True)
+        p_path.write_text(proc_xml, encoding="utf-8")
+
+        v_res = extract_xios(v_path, root=root)
+        p_res = extract_xios(p_path, root=root)
+
+        all_nodes = v_res["nodes"] + p_res["nodes"]
+        all_edges = v_res["edges"] + p_res["edges"]
+
+        # Check unnamed custom component created
+        custom_nodes = [n for n in all_nodes if n.get("node_kind") == "custom_component"]
+        assert len(custom_nodes) == 1
+        assert custom_nodes[0]["_xios_tag"] == "pipeline"
+
+        # Check alias URI resolved with canonical node id
+        alias_edges = [e for e in all_edges if e.get("context") == "alias_resource"]
+        assert len(alias_edges) == 1
+        assert alias_edges[0]["target"] == "operations_po_track"
+
+        # Run resolution pass
+        resolve_xios_view_process_links([], all_nodes, all_edges)
+
+        # Check boot edges
+        boot_startup = [e for e in all_edges if e.get("context") == "boot_startup"]
+        assert len(boot_startup) >= 1
+        startup_targets = {e["target"] for e in boot_startup}
+        assert "service_database" in startup_targets or "published_published" in startup_targets
+
+        boot_system = [e for e in all_edges if e.get("context") == "boot_system"]
+        assert len(boot_system) >= 1
+        system_targets = {e["target"] for e in boot_system}
+        assert "config_system_cbe" in system_targets
+
+
