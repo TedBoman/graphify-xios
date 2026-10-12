@@ -100,6 +100,16 @@ graphify-out/
 
 From then on, Claude Code will automatically consult the graph to answer questions about your XIOS codebase without needing to grep raw files!
 
+### Automatic & Persistent Across Sessions
+
+* **Do you need to manually tell Claude to use the graph?**
+  **No.** Claude checks the graph automatically.
+* **Do you need to re-run or remind Claude for every new session?**
+  **No.** Once built, it persists across all future sessions automatically:
+  1. **Automatic Startup Guidance (`CLAUDE.md`)**: Claude Code reads `CLAUDE.md` at the start of **every session**. It explicitly instructs Claude to query `graphify-out/graph.json` first (`graphify query`, `graphify path`, `graphify explain`) for any codebase questions.
+  2. **Active Pre-Tool Hooks (`.claude/settings.json`)**: Active hooks intercept raw search tool calls (`Grep`, `Glob`, `Read`). If Claude ever attempts to search files blindly, the hook fires and nudges Claude back to the knowledge graph.
+  3. **Auto-Updates on Code Changes**: When code is edited, Claude will automatically run `graphify update .` to sync the graph incrementally in milliseconds with zero API token cost.
+
 ---
 
 **Standard Graphify Get started** (30 seconds):
