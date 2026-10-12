@@ -871,6 +871,15 @@ def install(platform: str = "claude", *, project: bool = False, project_dir: Pat
             claude_md, "  CLAUDE.md        ->  ", _skill_registration(skill_ref)
         )
 
+    if platform == "claude":
+        # Wire Claude Code PreToolUse hooks so raw search/read is intercepted
+        hook_target_dir = project_dir if project else Path.home()
+        _install_claude_hook(hook_target_dir, project=project)
+        # Also wire project CLAUDE.md if in a project directory
+        if project or (project_dir / "CLAUDE.md").exists() or (project_dir / ".git").exists() or (project_dir / "graphify-out").exists():
+            claude_install(project_dir, project=project)
+
+
     if platform == "codebuddy":
         # Register in ~/.codebuddy/CODEBUDDY.md (CodeBuddy only)
         _register_always_on_block(

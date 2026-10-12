@@ -48,7 +48,7 @@ Type `/graphify` in your AI coding assistant and it maps your entire project (co
 </p>
 
 > [!TIP]
-> **XIOS/3 Edition**: This fork includes native AST extraction for **XIOS/3 applications** (`.xml` processes, `.xml` views, `index.xml` application manifest, `types.xml`, and `.xsl` component skins).
+> **XIOS/3 Edition**: This fork includes native AST extraction for **XIOS/3 applications** (`.xml` processes, `.xml` views, `index.xml` application manifests, `system_cbe.xml`, catalogs, `types.xml`, `.xsl` component skins, custom UI tags like `<plotly>` / `<pipeline>` / `<diagram>`, and boot configs).
 
 ## Claude Code Quickstart (XIOS/3 Edition)
 
@@ -64,7 +64,7 @@ cd graphify-xios
 pip install -e .
 ```
 
-### 2. Register the skill with Claude Code
+### 2. Register with Claude Code (One Command)
 
 Run this once:
 
@@ -72,7 +72,13 @@ Run this once:
 graphify install
 ```
 
-This installs the skill to `~/.claude/skills/graphify/SKILL.md` so Claude Code recognizes the `/graphify` slash command.
+This single command automatically sets up everything:
+* Installs the `/graphify` skill (`~/.claude/skills/graphify/SKILL.md`).
+* Installs the active **PreToolUse hooks** (`~/.claude/settings.json` and `.claude/settings.json`), intercepting raw `Grep`/`Read` commands and reminding Claude to query the knowledge graph.
+* Configures `CLAUDE.md` with strict token-saving rules (safely preserving your existing instructions).
+
+> [!NOTE]
+> You can also run `graphify claude install` inside any project folder to re-sync or scope settings directly to that project.
 
 ### 3. Open Claude Code in your XIOS project
 
@@ -83,13 +89,13 @@ cd /path/to/your/xios-project
 claude
 ```
 
-Then simply type:
+Then simply build the graph:
 
 ```
 /graphify .
 ```
 
-Claude Code will automatically detect and parse all your XIOS XML processes, views, triggers, operations, data bindings, and XSL skins, outputting:
+Graphify automatically detects and parses all your XIOS XML processes, views, triggers, operations, data bindings, custom UI components, and XSL skins into:
 
 ```
 graphify-out/
@@ -98,53 +104,46 @@ graphify-out/
 └── graph.json       the full queryable knowledge graph
 ```
 
-From then on, Claude Code will automatically consult the graph to answer questions about your XIOS codebase without needing to grep raw files!
+---
+
+### How to Ask Codebase Questions (Save 95%+ Tokens)
+
+> [!IMPORTANT]
+> **Never tell Claude to "read the graph file" or "use graphify-out/graph.json".**
+> `graph.json` is a multi-megabyte file (often 10–15 MB on real projects) and `GRAPH_REPORT.md` is 100+ KB. Reading them directly into Claude's context window will blow through **30,000 to 100,000+ tokens** in a single turn!
+>
+> Instead, always query the graph through the tool commands:
+
+* **In Claude Code chat:**
+  ```text
+  /graphify query "How does user authentication work?"
+  /graphify path "LoginProcess" "DatabaseView"
+  /graphify explain "CA_Pipeline"
+  ```
+* **Or tell Claude:**
+  *"Run `graphify query '<question>'` in terminal to check how X works."*
+
+These commands run locally and return only a compact 20–40 line subgraph (**~300 tokens**), giving Claude exact, grounded architecture context at virtually zero token cost.
+
+---
 
 ### Automatic & Persistent Across Sessions
 
-* **Do you need to manually tell Claude to use the graph?**
-  **No.** Claude checks the graph automatically.
-* **Do you need to re-run or remind Claude for every new session?**
-  **No.** Once built, it persists across all future sessions automatically:
-  1. **Automatic Startup Guidance (`CLAUDE.md`)**: Claude Code reads `CLAUDE.md` at the start of **every session**. It explicitly instructs Claude to query `graphify-out/graph.json` first (`graphify query`, `graphify path`, `graphify explain`) for any codebase questions.
-  2. **Active Pre-Tool Hooks (`.claude/settings.json`)**: Active hooks intercept raw search tool calls (`Grep`, `Glob`, `Read`). If Claude ever attempts to search files blindly, the hook fires and nudges Claude back to the knowledge graph.
-  3. **Auto-Updates on Code Changes**: When code is edited, Claude will automatically run `graphify update .` to sync the graph incrementally in milliseconds with zero API token cost.
+* **Do you need to manually remind Claude to use the graph?**
+  **No.** The active PreToolUse hook in `.claude/settings.json` intercepts Claude's raw searches (`Grep`, `Glob`, `Read`) and automatically guides Claude to `graphify query`.
+* **Do you need to rebuild the graph manually after editing code?**
+  **No.** When files change, run `graphify update .` (or Claude will run it) to incrementally re-extract changed files in milliseconds with zero LLM API cost.
 
-#### Where `CLAUDE.md` Lives & How to Create It
+---
 
-`CLAUDE.md` sits directly in the **root directory of your project**, right beside `graphify-out/`:
+### XIOS/3 Features & Capabilities in this Release
 
-```
-your-project/
-├── CLAUDE.md          <-- Put it right here!
-├── index.xml
-├── views/
-├── processes/
-├── components/
-└── graphify-out/
-```
+* **View & UI Hierarchy**: Layout panels, custom tags (`<plotly>`, `<pipeline>`, `<diagram>`, `<filepicker>`, `<chatrender>`), buttons, inputs, data grids, and component references.
+* **Process Flow & Operations**: `<trigger>` events (`Click`, `DoubleClick`, `Select`, `Opened`), `<step>` transitions, `<operation>` actions (`open`, `bind`, `callMethod`, `call`, `close`, `save`, `change`), and inline/external script imports.
+* **Boot & Manifest Linking**: Automatically discovers and links boot entry points (`window.boot = { startup: "...", system: "..." }` in `index.html`), published application packages, and catalogs (`widgets.xml`).
+* **Canonical Node Resolution (`_xios_file_nid`)**: Resolves `host://`, `xios://`, and relative paths directly to canonical file and symbol node IDs, unifying 99%+ of views, processes, and scripts into a single connected core component.
+* **Component Skins**: Parses `.xsl` / `.xslt` templates, `apply-templates`, `call-template`, and skin includes.
 
-* **Option A (Automatic - Recommended)**:
-  Open a terminal inside your project folder and run:
-  ```bash
-  graphify claude install
-  ```
-  This creates `CLAUDE.md` and registers `.claude/settings.json` hooks in one go. *(If you already have an existing `CLAUDE.md`, it does **not** overwrite it—it safely appends the `## graphify` section to the bottom, preserving all your existing project rules).*
-
-* **Option B (Manual)**:
-  If `CLAUDE.md` doesn't exist, create it in your project root. If you already have one, simply append this block to the bottom of the file:
-  ```markdown
-  ## graphify
-
-  This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
-
-  Rules:
-  - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-  - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
-  - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
-  - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
-  - A committed graphify-out/graph.json is rewritten whole on every build, so a large diff to it in a pull request is expected. Do not flag it as churn or suggest skipping the graph rebuild or its hooks.
-  ```
 
 ---
 
