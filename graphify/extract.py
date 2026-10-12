@@ -71,7 +71,12 @@ from graphify.extractors.sql import extract_sql  # noqa: F401
 from graphify.extractors.terraform import extract_terraform, prepare_terraform, resolve_terraform_modules  # noqa: F401
 from graphify.extractors.verilog import extract_verilog  # noqa: F401
 from graphify.extractors.vbnet import extract_vbnet, resolve_vbnet_partial_calls  # noqa: F401
-from graphify.extractors.xios import extract_xios, extract_xios_xsl, is_xios_xml  # noqa: F401
+from graphify.extractors.xios import (  # noqa: F401
+    extract_xios,
+    extract_xios_xsl,
+    is_xios_xml,
+    resolve_xios_view_process_links,
+)
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
 from graphify.paths import disambiguate_ambiguous_candidates
@@ -6303,6 +6308,13 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver(
         "markdown_mentions", MARKDOWN_MENTION_SUFFIXES, resolve_markdown_mentions
+    )
+)
+register_language_resolver(
+    LanguageResolver(
+        "xios_view_process_links",
+        frozenset({".xml"}),
+        resolve_xios_view_process_links,
     )
 )
 
