@@ -110,6 +110,32 @@ From then on, Claude Code will automatically consult the graph to answer questio
   2. **Active Pre-Tool Hooks (`.claude/settings.json`)**: Active hooks intercept raw search tool calls (`Grep`, `Glob`, `Read`). If Claude ever attempts to search files blindly, the hook fires and nudges Claude back to the knowledge graph.
   3. **Auto-Updates on Code Changes**: When code is edited, Claude will automatically run `graphify update .` to sync the graph incrementally in milliseconds with zero API token cost.
 
+#### Where `CLAUDE.md` Lives & How to Create It
+
+`CLAUDE.md` sits in the **root directory of your project** (e.g. `R:\aimcount\CLAUDE.md`, right beside `graphify-out/`).
+
+* **Option A (Automatic - Recommended)**:
+  Open a terminal inside your project folder and run:
+  ```bash
+  graphify claude install
+  ```
+  This creates `CLAUDE.md` and registers `.claude/settings.json` hooks in one go.
+
+* **Option B (Manual)**:
+  Create a file named `CLAUDE.md` in your project root with this content:
+  ```markdown
+  ## graphify
+
+  This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+  Rules:
+  - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+  - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+  - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+  - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+  - A committed graphify-out/graph.json is rewritten whole on every build, so a large diff to it in a pull request is expected. Do not flag it as churn or suggest skipping the graph rebuild or its hooks.
+  ```
+
 ---
 
 **Standard Graphify Get started** (30 seconds):
