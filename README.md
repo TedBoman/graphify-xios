@@ -50,6 +50,10 @@ And run:
 
 *(Alternatively, run `graphify extract . --code-only` directly from your terminal).*
 
+> [!TIP]
+> **Graphing XIOS files is free: no tokens are used.**
+> XIOS XML views, processes, manifests, and XSL/XSLT skins are parsed locally by the native AST extractor, so no LLM is called and no API tokens are spent. Only non-code content, such as Markdown docs or PDFs, goes through LLM extraction. Use `--code-only` to skip it and keep the whole run at zero token cost.
+
 Graphify outputs three artifacts in `graphify-out/`:
 * `graph.html`: Interactive browser visualization of your codebase and detected communities.
 * `graph.json`: The complete queryable knowledge graph with canonical node IDs and relations.
