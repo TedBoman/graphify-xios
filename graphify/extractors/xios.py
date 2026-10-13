@@ -1701,7 +1701,7 @@ def resolve_xios_view_process_links(
             if stem:
                 comps_by_stem.setdefault((stem.lower(), c_lower), []).append(nid)
 
-    def resolve_comp(target_view: str, target_comp: str) -> str | None:
+    def resolve_comp(target_view: str | None, target_comp: str | None) -> str | None:
         if not target_comp:
             return None
         c_lower = target_comp.lower()
