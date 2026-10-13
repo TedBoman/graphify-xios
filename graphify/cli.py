@@ -381,7 +381,9 @@ def _stale_graph_sources(
                 excluded_prefixes.append(e)
             else:
                 excluded_exact.add(e)
-        for entry in detection.get("skipped_sensitive", []):
+        for entry in list(detection.get("skipped_sensitive", [])) + list(
+            detection.get("skipped_generated", [])
+        ):
             excluded_exact.add(nfc(str(entry).split(" [", 1)[0]))
 
     def _provably_excluded(c: Path) -> bool:
@@ -3858,6 +3860,14 @@ def dispatch_command(cmd: str) -> None:
                 f"[graphify extract] {len(_sec)} file(s) skipped as potentially sensitive "
                 f"(rename or move if wrongly flagged): {_snames}{_smore}"
             )
+        _generated = detection.get("skipped_generated", []) if isinstance(detection, dict) else []
+        if _generated:
+            _n_min = sum(1 for g in _generated if g.endswith("[minified bundle]"))
+            _n_icon = len(_generated) - _n_min
+            print(
+                f"[graphify extract] skipped {_n_min} minified bundle(s) and {_n_icon} icon asset(s) "
+                f"(set GRAPHIFY_INCLUDE_MINIFIED=1 / GRAPHIFY_INCLUDE_ICON_ASSETS=1 to keep them)"
+            )
         stages.mark("detect")
 
         # Resolve the LLM backend only now that we know whether the corpus
@@ -4259,6 +4269,13 @@ def dispatch_command(cmd: str) -> None:
                 _dropped_files, _dropped_items = _scope_semantic_result(
                     fresh, target, uncached_paths,
                 )
+                from graphify.semantic_cleanup import ground_extracted_edges as _ground
+                _n_ungrounded = _ground(fresh, root=target)
+                if _n_ungrounded:
+                    print(
+                        f"[graphify extract] downgraded {_n_ungrounded} EXTRACTED edge(s) to "
+                        f"INFERRED: an endpoint is not mentioned in the cited source file"
+                    )
                 if _dropped_files:
                     print(
                         f"[graphify extract] dropped {_dropped_items} out-of-scope "

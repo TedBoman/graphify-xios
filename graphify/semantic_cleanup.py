@@ -297,7 +297,83 @@ def sanitize_semantic_fragment(fragment: dict) -> dict:
     fragment["nodes"] = keep_nodes
     fragment["edges"] = keep_edges
     fragment["hyperedges"] = keep_hyperedges
+    ground_extracted_edges(fragment)
     return fragment
+
+
+_GROUNDING_MAX_BYTES = 2 * 1024 * 1024
+_GROUNDING_MIN_TERM = 3
+_PAREN_RE = re.compile(r"\(([^()]*)\)")
+
+
+def _grounding_terms(node: dict) -> list[str]:
+    """Strings whose presence in a file shows that file mentions *node*.
+
+    A semantic label is often descriptive ("XIOS boot config (var boot +
+    /xios/boot.js)"), so besides the full label this tries the label without its
+    parenthetical, each ``+``/``,``-separated piece inside the parentheses, and the id.
+    """
+    label = str(node.get("label") or "").strip()
+    terms = [label, _PAREN_RE.sub("", label).strip(), str(node.get("id") or "")]
+    for inner in _PAREN_RE.findall(label):
+        terms.extend(p.strip() for p in re.split(r"[+,;]", inner))
+    return [t.lower() for t in terms if len(t) >= _GROUNDING_MIN_TERM]
+
+
+def ground_extracted_edges(fragment: dict, root: str | Path | None = None) -> int:
+    """Downgrade EXTRACTED edges whose source file does not mention both endpoints.
+
+    ``EXTRACTED`` claims the relationship is stated in ``source_file``. An LLM
+    sometimes attaches a cross-file inference to one file (``@playwright/test
+    --implements--> XIOS boot config`` cited to test.html, which never mentions
+    Playwright). Such an edge becomes ``INFERRED`` with a ``grounding`` note.
+    An endpoint counts as mentioned when the node was itself extracted from that
+    file or one of its grounding terms appears there (case-insensitive). Edges
+    whose file cannot be read, or whose endpoints are not in this fragment, are
+    left alone. Returns the number of edges downgraded.
+    """
+    base = Path(root) if root is not None else Path.cwd()
+    node_by_id = {n.get("id"): n for n in fragment.get("nodes", []) if isinstance(n, dict)}
+    texts: dict[str, str | None] = {}
+
+    def _text(sf: str) -> str | None:
+        if sf not in texts:
+            p = Path(sf)
+            if not p.is_absolute():
+                p = base / p
+            try:
+                if p.stat().st_size > _GROUNDING_MAX_BYTES:
+                    texts[sf] = None
+                else:
+                    texts[sf] = p.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                texts[sf] = None
+        return texts[sf]
+
+    def _same_file(a: str, b: str) -> bool:
+        return Path(a).as_posix().lower() == Path(b).as_posix().lower()
+
+    downgraded = 0
+    for e in fragment.get("edges", []):
+        if not isinstance(e, dict) or e.get("confidence") != "EXTRACTED":
+            continue
+        sf = e.get("source_file")
+        src, tgt = node_by_id.get(e.get("source")), node_by_id.get(e.get("target"))
+        if not sf or src is None or tgt is None:
+            continue
+        text = _text(str(sf))
+        if text is None:
+            continue
+        missing = [
+            n.get("id") for n in (src, tgt)
+            if not (n.get("source_file") and _same_file(str(n["source_file"]), str(sf)))
+            and not any(t in text for t in _grounding_terms(n))
+        ]
+        if missing:
+            e["confidence"] = "INFERRED"
+            e["grounding"] = f"not mentioned in {sf}: {', '.join(map(str, missing))}"
+            downgraded += 1
+    return downgraded
 
 
 def _is_sentence_like_rationale_label(label: str) -> bool:

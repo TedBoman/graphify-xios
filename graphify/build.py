@@ -727,6 +727,44 @@ def edge_data(G: nx.Graph, u: str, v: str) -> dict:
     return raw
 
 
+_PARALLEL_FIELDS = ("count", "contexts", "relations")
+
+
+def _merge_parallel_edge(existing: dict, incoming: dict, seen: set[tuple]) -> None:
+    """Fold *incoming* into the record of edges collapsed onto *existing*'s pair.
+
+    Writes ``count`` (distinct occurrences), ``contexts`` and ``relations``
+    (distinct values, first-seen order) into both dicts, so the merged record
+    survives whichever of the two the caller keeps. *seen* holds the
+    (relation, context, source_file, source_location) keys already folded for
+    this pair; an exact re-emission of one of them changes nothing.
+    """
+    def _key(d: dict) -> tuple:
+        return (d.get("relation"), d.get("context"), d.get("source_file"), d.get("source_location"))
+
+    if not seen:
+        seen.add(_key(existing))
+    k = _key(incoming)
+    if k not in seen:
+        seen.add(k)
+        contexts = list(existing.get("contexts") or
+                        ([existing["context"]] if existing.get("context") else []))
+        relations = list(existing.get("relations") or
+                         ([existing["relation"]] if existing.get("relation") else []))
+        if incoming.get("context") and incoming["context"] not in contexts:
+            contexts.append(incoming["context"])
+        if incoming.get("relation") and incoming["relation"] not in relations:
+            relations.append(incoming["relation"])
+        existing["count"] = int(existing.get("count", 1)) + 1
+        if len(contexts) > 1:
+            existing["contexts"] = contexts
+        if len(relations) > 1:
+            existing["relations"] = relations
+    for field in _PARALLEL_FIELDS:
+        if field in existing:
+            incoming[field] = existing[field]
+
+
 def edge_datas(G: nx.Graph, u: str, v: str) -> list[dict]:
     """Return every edge attribute dict for (u, v); always a list."""
     raw = G[u][v]
@@ -1419,6 +1457,9 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     for alias_key, candidates in _alias_candidates.items():
         if len(candidates) == 1:
             norm_to_id.setdefault(alias_key, next(iter(candidates)))
+    # Distinct occurrences already folded into each stored pair (see
+    # _merge_parallel_edge), so an exact re-emission is not counted twice.
+    _parallel_seen: dict[tuple[str, str], set[tuple]] = {}
     # Iterate edges in a deterministic order. The graph is undirected and stores
     # direction in _src/_tgt; when two edges collapse onto the same node pair the
     # last write wins, so an unstable iteration order flips _src/_tgt run-to-run
@@ -1558,6 +1599,16 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         # causing display functions to show edges backwards.
         attrs["_src"] = src
         attrs["_tgt"] = tgt
+        # A plain Graph keeps one edge per pair, so distinct facts between the same
+        # two nodes (11 `catalogs(...)` references from one widget catalog, a
+        # `calls` plus a `references`) would collapse and all but one `context`
+        # would be lost. Fold every occurrence into `count` / `contexts` /
+        # `relations` on BOTH dicts before the winner is chosen below, so the
+        # surviving edge carries the merged record whichever one it is.
+        if G.has_edge(src, tgt) and not G.is_multigraph():
+            _pair = (src, tgt) if G.is_directed() else tuple(sorted((src, tgt)))
+            _merge_parallel_edge(
+                edge_data(G, src, tgt), attrs, _parallel_seen.setdefault(_pair, set()))
         # Before the drops below, so a runtime import that folds into a
         # type-only edge still clears its marker (#3159). The reverse-direction
         # duplicate that the undirected graph drops (#1061) is another file's

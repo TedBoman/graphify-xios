@@ -1089,6 +1089,61 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
+_GROUP_MIN_NODES = 3
+_GROUP_MAX_SITES = 4
+
+
+def _grouped_node_line(G: nx.Graph, label: str, members: list[str]) -> str:
+    """One NODE line standing for every node in *members* (all labelled *label*)."""
+    sites = []
+    files = []
+    for m in members:
+        d = G.nodes[m]
+        sf = str(d.get("source_file", ""))
+        files.append(sf)
+        sites.append(f"{sf}:{d.get('source_location', '')}")
+    dirs = {os.path.dirname(f.replace("\\", "/")) for f in files}
+    where = (f"{next(iter(dirs))}/*" if len(dirs) == 1 else f"{len(set(files))} files")
+    shown = ", ".join(sites[:_GROUP_MAX_SITES])
+    more = f", +{len(sites) - _GROUP_MAX_SITES} more" if len(sites) > _GROUP_MAX_SITES else ""
+    return (
+        f"NODE {sanitize_label(label)} "
+        f"[x{len(members)} nodes in {sanitize_label(where)} "
+        f"sites={sanitize_label(shown + more)}]"
+    )
+
+
+def _path_seed_nodes(G: nx.Graph, question: str, limit: int = 50) -> list[str]:
+    """Nodes that name an exact path written in *question* (``processes/dashboard.xml``).
+
+    Word tokenization splits a path into ``processes``/``dashboard``/``xml`` and
+    seeds on whatever shares those words; an exact path is a far stronger
+    signal, so nodes whose label, target or source file contains it seed first.
+    """
+    paths = [
+        p.strip("'\"`,.;:?()").replace("\\", "/").lower()
+        for p in question.split()
+        if "/" in p or "\\" in p or re.search(r"\.\w{1,5}$", p.strip("'\"`,.;:?()"))
+    ]
+    paths = [p for p in paths if len(p) >= 4 and not p.startswith("--")]
+    if not paths:
+        return []
+    hits: list[tuple[int, str]] = []
+    for nid, d in G.nodes(data=True):
+        label = str(d.get("label") or "").replace("\\", "/").lower()
+        target = str(d.get("_xios_target") or "").replace("\\", "/").lower()
+        sf = str(d.get("source_file") or "").replace("\\", "/").lower()
+        for p in paths:
+            if p in label or p in target:
+                hits.append((0, nid))
+                break
+            if sf == p or sf.endswith("/" + p):
+                hits.append((1, nid))
+                break
+    hits.sort(key=lambda h: (h[0], -G.degree(h[1]), str(h[1])))
+    return [nid for _r, nid in hits[:limit]]
+
+
 def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
     """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
 
@@ -1097,6 +1152,7 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
     """
     char_budget = token_budget * 3
     lines = []
+    node_entries: list[tuple[str, str]] = []
     # Work-memory overlay (derived sidecar) stashed on the graph at load time.
     # Empty when no sidecar exists, so un-annotated output stays byte-identical.
     overlay = getattr(G, "graph", {}).get("_learning_overlay", {}) or {}
@@ -1177,7 +1233,29 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
             f"{learning_suffix}"
             f"{attrs_suffix}]"
         )
+        node_entries.append((nid, line))
+    # Many nodes sharing one label (27 `open(host://service/processes/dashboard.xml)`
+    # nodes, one per manifest) are one answer, not 27: render them as a single
+    # grouped line so the budget cut cannot hide all but the first (#query-group).
+    by_label: dict[str, list[str]] = {}
+    for nid, _l in node_entries:
+        by_label.setdefault(str(G.nodes[nid].get("label", nid)), []).append(nid)
+    emitted_groups: set[str] = set()
+    seed_line_count = 0
+    for nid, line in node_entries:
+        label = str(G.nodes[nid].get("label", nid))
+        members = by_label[label]
+        if len(members) >= _GROUP_MIN_NODES:
+            if label in emitted_groups:
+                continue
+            emitted_groups.add(label)
+            line = _grouped_node_line(G, label, members)
         lines.append(line)
+        if any(m in seed_set for m in (members if len(members) >= _GROUP_MIN_NODES else [nid])):
+            seed_line_count = len(lines)
+    edge_lines: list[str] = []
+    edge_counts: dict[str, int] = {}
+    edge_first_at: dict[str, str] = {}
     for u, v in edges:
         if u in nodes and v in nodes:
             raw = G[u][v]
@@ -1206,13 +1284,24 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
                 f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(_loc)}"
                 if _loc else ""
             )
+            if d.get("count", 1) > 1:
+                context_suffix += f" count={int(d['count'])}"
             line = (
                 f"EDGE {sanitize_label(G.nodes[src].get('label', src))} "
                 f"--{sanitize_label(str(d.get('relation', '')))} "
                 f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
-                f"{sanitize_label(G.nodes[tgt].get('label', tgt))}{at_suffix}"
+                f"{sanitize_label(G.nodes[tgt].get('label', tgt))}"
             )
-            lines.append(line)
+            # Edges between grouped nodes repeat the same text once per member;
+            # keep one line with a multiplicity and the first site.
+            if line not in edge_counts:
+                edge_lines.append(line)
+                edge_counts[line] = 0
+                edge_first_at[line] = at_suffix
+            edge_counts[line] += 1
+    for line in edge_lines:
+        n = edge_counts[line]
+        lines.append(line + (f" x{n}" if n > 1 else "") + edge_first_at[line])
     output = "\n".join(lines)
     if len(output) > char_budget:
         cut_at = output[:char_budget].rfind("\n")
@@ -1222,7 +1311,7 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
         # question named must always be in the answer (#BUG2). Seeds are bounded
         # (_pick_seeds max_k + one per term), so the overshoot is a few lines.
         if seed_hits:
-            seed_block_end = sum(len(lines[i]) + 1 for i in range(len(seed_hits))) - 1
+            seed_block_end = sum(len(lines[i]) + 1 for i in range(seed_line_count)) - 1
             cut_at = max(cut_at, min(seed_block_end, len(output)))
         total_nodes = sum(1 for l in lines if l.startswith("NODE "))
         shown_nodes = output[:cut_at].count("\nNODE ") + (1 if output.startswith("NODE ") else 0)
@@ -1410,7 +1499,9 @@ def _query_graph_text(
         best_seed_by_term = {
             t: nid for t, nid in best_seed_by_term.items() if t not in intent
         }
-    start_nodes = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term)
+    # An exact path in the question outranks every label-word match.
+    start_nodes = _path_seed_nodes(G, question) or _pick_seeds(
+        qs.ranked, G=G, best_seed_by_term=best_seed_by_term)
     if not start_nodes:
         return _QUERY_NO_MATCH
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)

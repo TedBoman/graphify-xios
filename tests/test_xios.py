@@ -553,3 +553,92 @@ def test_xios_boot_and_published_application_linking():
         assert "config_system_cbe" in system_targets
 
 
+
+
+def test_xios_open_process_does_not_resolve_to_same_named_view():
+    """open(host://service/processes/dashboard.xml) must link the process, not views/dashboard.xml."""
+    manifest_xml = """<?xml version="1.0" encoding="utf-8"?>
+<application name="Account" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <process name="Boot - Account">
+    <step id="init">
+      <operation name="open" value="host://service/processes/dashboard.xml"/>
+    </step>
+  </process>
+</application>"""
+    shell_proc_xml = """<?xml version="1.0" encoding="utf-8"?>
+<process name="Shell">
+  <step id="start"/>
+</process>"""
+    view_xml = """<?xml version="1.0" encoding="utf-8"?>
+<view name="DE"/>"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "service" / "manifests").mkdir(parents=True)
+        (root / "service" / "processes").mkdir(parents=True)
+        (root / "service" / "views").mkdir(parents=True)
+        m_path = root / "service" / "manifests" / "account.xml"
+        p_path = root / "service" / "processes" / "dashboard.xml"
+        v_path = root / "service" / "views" / "dashboard.xml"
+        m_path.write_text(manifest_xml, encoding="utf-8")
+        p_path.write_text(shell_proc_xml, encoding="utf-8")
+        v_path.write_text(view_xml, encoding="utf-8")
+
+        results = [extract_xios(p, root=root) for p in (m_path, p_path, v_path)]
+        all_nodes = [n for r in results for n in r["nodes"]]
+        all_edges = [e for r in results for e in r["edges"]]
+        resolve_xios_view_process_links([], all_nodes, all_edges)
+
+        view_nid = next(n["id"] for n in all_nodes if n.get("label") == "DE")
+        proc_nid = next(n["id"] for n in all_nodes if n.get("label") == "Shell")
+        assert not [e for e in all_edges if e["target"] == view_nid], \
+            "process open must not resolve to the same-named view"
+        open_ctx = {e.get("context") for e in all_edges if e["target"] == proc_nid}
+        assert "opens_process" in open_ctx
+        assert "opens_view" not in {e.get("context") for e in all_edges
+                                    if e.get("source_file") == str(m_path)}
+
+
+def test_xios_source_locations_point_at_the_element():
+    """Operation nodes and step edges cite the line of their own element, also in manifests."""
+    proc_xml = """<?xml version="1.0" encoding="utf-8"?>
+<process name="Support">
+  <step id="cbeSupportInit">
+    <operation name="call" value="noteActivity"/>
+  </step>
+  <step id="noteActivity">
+    <operation name="call" value="ticketIdleArm"/>
+  </step>
+  <step id="ticketIdleArm">
+    <operation name="call" value="ticketIdleExpire"/>
+  </step>
+  <step id="ticketIdleExpire"/>
+</process>"""
+    manifest_xml = """<?xml version="1.0" encoding="utf-8"?>
+<application name="Account">
+  <process name="Boot">
+
+    <step id="init">
+      <operation name="open" value="host://views/home.xml"/>
+    </step>
+  </process>
+</application>"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        p_path = root / "support.xml"
+        m_path = root / "account.xml"
+        p_path.write_text(proc_xml, encoding="utf-8")
+        m_path.write_text(manifest_xml, encoding="utf-8")
+
+        p_res = extract_xios(p_path, root=root)
+        calls = {(e["source"].rsplit("_", 1)[-1], e["target"].rsplit("_", 1)[-1]): e["source_location"]
+                 for e in p_res["edges"] if e.get("context") == "step_call"}
+        assert calls[("noteactivity", "ticketidlearm")] == "L7"
+        assert calls[("ticketidlearm", "ticketidleexpire")] == "L10"
+        steps = {n["_xios_step_id"]: n["source_location"] for n in p_res["nodes"] if "_xios_step_id" in n}
+        assert steps["ticketIdleArm"] == "L9"
+
+        m_res = extract_xios(m_path, root=root)
+        open_node = next(n for n in m_res["nodes"] if n.get("_xios_op") == "open")
+        assert open_node["source_location"] == "L6"

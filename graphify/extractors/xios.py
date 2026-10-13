@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 from pathlib import Path
 from typing import Callable
 
@@ -60,6 +61,45 @@ def _strip_ns(tag: str) -> str:
     if tag.startswith("{"):
         return tag.split("}", 1)[1]
     return tag
+
+
+# Private attribute recording each element's 1-based source line. ElementTree
+# does not track positions, so _parse_xml stamps it at parse time.
+_LINE_ATTR = "{urn:graphify:xios}line"
+
+
+def _parse_xml(raw: bytes) -> ET.Element:
+    """Parse *raw* like ET.fromstring, but stamp every element with its source line."""
+    builder = ET.TreeBuilder()
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.buffer_text = True
+
+    def _qname(name: str) -> str:
+        return "{" + name if "}" in name else name
+
+    def _start(tag: str, attrs: dict) -> None:
+        a = {_qname(k): v for k, v in attrs.items()}
+        a[_LINE_ATTR] = str(parser.CurrentLineNumber)
+        builder.start(_qname(tag), a)
+
+    parser.StartElementHandler = _start
+    parser.EndElementHandler = lambda tag: builder.end(_qname(tag))
+    parser.CharacterDataHandler = builder.data
+    try:
+        parser.Parse(raw, True)
+    except expat.ExpatError as e:
+        raise ET.ParseError(str(e)) from e
+    return builder.close()
+
+
+def _line(el: ET.Element | None) -> int:
+    """Source line of *el* as stamped by _parse_xml (1 when unknown)."""
+    if el is None:
+        return 1
+    try:
+        return int(el.get(_LINE_ATTR, "1"))
+    except ValueError:
+        return 1
 
 
 def _attr(el: ET.Element, local: str, ns: str | None = None) -> str:
@@ -132,6 +172,45 @@ def _resolve_xios_uri(base_file: Path, uri: str, root: Path | None = None) -> Pa
         if (host_root / clean).exists():
             return (host_root / clean).resolve()
         return Path(os.path.normpath(str(cand)))
+
+
+_DOC_KIND_CACHE: dict[str, str] = {}
+_ROOT_TAG_RE = re.compile(rb"<([A-Za-z_][\w.\-]*:)?([A-Za-z_][\w.\-]*)")
+_DIR_KIND = {"processes": "process", "views": "view", "manifests": "application"}
+
+
+def _xios_doc_kind(target: Path) -> str:
+    """Kind of XIOS document at *target*: 'process', 'view', 'application' or ''.
+
+    Read from the target's root element; when the file is not on disk, fall back
+    to the conventional parent directory (processes/, views/, manifests/).
+    """
+    key = str(target)
+    if key in _DOC_KIND_CACHE:
+        return _DOC_KIND_CACHE[key]
+    kind = ""
+    try:
+        head = target.read_bytes()[:4096]
+    except OSError:
+        head = b""
+    if head:
+        # Skip the XML declaration, comments, PIs and doctype to reach the root tag.
+        body = re.sub(rb"<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>]*>", b"", head, flags=re.DOTALL)
+        m = _ROOT_TAG_RE.search(body)
+        if m:
+            tag = m.group(2).decode("ascii", "replace")
+            if tag in (_XIOS_PROCESS_ROOT, _XIOS_VIEW_ROOT, _XIOS_APP_ROOT):
+                kind = tag
+    else:
+        kind = _DIR_KIND.get(target.parent.name.lower(), "")
+    _DOC_KIND_CACHE[key] = kind
+    return kind
+
+
+def _opens_context(target: Path) -> str:
+    """Edge context for an ``open`` operation, named after the target's document kind."""
+    return {"process": "opens_process", "application": "opens_application"}.get(
+        _xios_doc_kind(target), "opens_view")
 
 
 def _xios_file_nid(target_path: Path, host_root: Path | None = None) -> str:
@@ -275,7 +354,7 @@ def extract_xios_xsl(path: Path) -> dict:
         return {"nodes": [], "edges": [], "error": "xsl file contains entity declarations"}
 
     try:
-        root = ET.fromstring(raw)
+        root = _parse_xml(raw)
     except ET.ParseError as e:
         return {"nodes": [], "edges": [], "error": f"xml parse error: {e}"}
 
@@ -318,23 +397,23 @@ def extract_xios_xsl(path: Path) -> dict:
         tpl_match = tpl.get("match", "") or ""
         label = tpl_name or f"match={tpl_match}" if tpl_match else "anonymous"
         tpl_nid = _make_id(stem, "tpl", tpl_name or tpl_match or "anon")
-        add_node(tpl_nid, label, 1, node_kind="template")
-        add_edge(file_nid, tpl_nid, "contains", 1)
+        add_node(tpl_nid, label, _line(tpl), node_kind="template")
+        add_edge(file_nid, tpl_nid, "contains", _line(tpl))
 
         # xsl:call-template → calls edge
         for ct in tpl.iter(f"{{{_XSL_NS}}}call-template"):
             called = ct.get("name", "")
             if called:
                 target_nid = _make_id(stem, "tpl", called)
-                add_edge(tpl_nid, target_nid, "calls", 1, context="call-template")
+                add_edge(tpl_nid, target_nid, "calls", _line(ct), context="call-template")
 
         # xsl:apply-templates → uses edge
         for at in tpl.iter(f"{{{_XSL_NS}}}apply-templates"):
             sel = at.get("select", "")
             if sel:
                 target_nid = _make_id(stem, "apply", sel)
-                add_node(target_nid, f"apply({sel})", 1, node_kind="template_target")
-                add_edge(tpl_nid, target_nid, "uses", 1, context="apply-templates")
+                add_node(target_nid, f"apply({sel})", _line(at), node_kind="template_target")
+                add_edge(tpl_nid, target_nid, "uses", _line(at), context="apply-templates")
 
     # xsl:include / xsl:import → imports edge
     for inc_tag in ("include", "import"):
@@ -343,7 +422,7 @@ def extract_xios_xsl(path: Path) -> dict:
             if href:
                 target_path = path.parent / href
                 target_nid = _make_id(str(target_path))
-                add_edge(file_nid, target_nid, "imports", 1,
+                add_edge(file_nid, target_nid, "imports", _line(inc),
                          context=f"xsl:{inc_tag}")
 
     return {"nodes": nodes, "edges": edges}
@@ -364,7 +443,7 @@ def extract_xios(path: Path, root: Path | None = None) -> dict:
         return {"nodes": [], "edges": [], "error": "xios xml file contains entity declarations"}
 
     try:
-        root_el = ET.fromstring(raw)
+        root_el = _parse_xml(raw)
     except ET.ParseError as e:
         return {"nodes": [], "edges": [], "error": f"xml parse error: {e}"}
 
@@ -437,14 +516,14 @@ def _extract_component_config(path: Path, root: ET.Element, raw: bytes, host_roo
     label = comp_name
     if comp_tag:
         label = f"{comp_name} <{comp_tag}>"
-    add_node(comp_nid, label, 1, node_kind="component_definition",
+    add_node(comp_nid, label, _line(root), node_kind="component_definition",
              extra={"tag": comp_tag, "class_name": comp_class, "_xios_comp_def": True})
-    add_edge(file_nid, comp_nid, "contains", 1)
+    add_edge(file_nid, comp_nid, "contains", _line(root))
 
     if comp_href:
         js_path = _resolve_xios_uri(path, comp_href, host_root)
         js_nid = _xios_file_nid(js_path, host_root)
-        add_edge(comp_nid, js_nid, "references", 1,
+        add_edge(comp_nid, js_nid, "references", _line(root),
                  context="implemented_by", target_file=str(js_path))
 
     for child in root:
@@ -455,14 +534,14 @@ def _extract_component_config(path: Path, root: ET.Element, raw: bytes, host_roo
         tgt_path = _resolve_xios_uri(path, href, host_root)
         tgt_nid = _xios_file_nid(tgt_path, host_root)
         if ctag == "skin":
-            add_edge(comp_nid, tgt_nid, "references", 1,
+            add_edge(comp_nid, tgt_nid, "references", _line(child),
                      context="skinned_by", target_file=str(tgt_path))
         elif ctag == "style":
-            add_edge(comp_nid, tgt_nid, "references", 1,
+            add_edge(comp_nid, tgt_nid, "references", _line(child),
                      context="styled_by", target_file=str(tgt_path))
         elif ctag == "dependency":
             sym = child.get("symbol", "")
-            add_edge(comp_nid, tgt_nid, "references", 1,
+            add_edge(comp_nid, tgt_nid, "references", _line(child),
                      context=f"depends_on({sym})" if sym else "depends_on",
                      target_file=str(tgt_path))
 
@@ -506,7 +585,7 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
     if startup:
         s_path = _resolve_xios_uri(path, startup, host_root)
         s_nid = _xios_file_nid(s_path, host_root)
-        add_edge(file_nid, s_nid, "references", 1, context="startup", target_file=str(s_path))
+        add_edge(file_nid, s_nid, "references", _line(root), context="startup", target_file=str(s_path))
 
     for param in root.iter("param"):
         pname = param.get("name", "")
@@ -514,7 +593,7 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
         if pval and (pval.endswith(".xml") or pval.endswith(".js") or pval.startswith("host://") or pval.startswith("xios://")):
             p_path = _resolve_xios_uri(path, pval, host_root)
             p_nid = _xios_file_nid(p_path, host_root)
-            add_edge(file_nid, p_nid, "references", 1,
+            add_edge(file_nid, p_nid, "references", _line(param),
                      context=f"configures({pname})" if pname else "configures",
                      target_file=str(p_path))
 
@@ -524,7 +603,7 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
         if chref:
             c_path = _resolve_xios_uri(path, chref, host_root)
             c_nid = _xios_file_nid(c_path, host_root)
-            add_edge(file_nid, c_nid, "references", 1,
+            add_edge(file_nid, c_nid, "references", _line(cls),
                      context=f"registers_class({cname})" if cname else "registers_class",
                      target_file=str(c_path))
 
@@ -535,7 +614,7 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
         if th_href:
             th_path = _resolve_xios_uri(path, th_href, host_root)
             th_nid = _xios_file_nid(th_path, host_root)
-            add_edge(file_nid, th_nid, "references", 1,
+            add_edge(file_nid, th_nid, "references", _line(th),
                      context=f"registers_theme({th_name})" if th_name else "registers_theme",
                      target_file=str(th_path))
 
@@ -552,14 +631,14 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
         label = comp_name
         if comp_tag:
             label = f"{comp_name} <{comp_tag}>"
-        add_node(comp_nid, label, 1, node_kind="component_definition",
+        add_node(comp_nid, label, _line(comp), node_kind="component_definition",
                  extra={"tag": comp_tag, "class_name": comp_class, "_xios_comp_def": True})
-        add_edge(file_nid, comp_nid, "contains", 1)
+        add_edge(file_nid, comp_nid, "contains", _line(comp))
 
         if comp_href:
             js_path = _resolve_xios_uri(path, comp_href, host_root)
             js_nid = _xios_file_nid(js_path, host_root)
-            add_edge(comp_nid, js_nid, "references", 1,
+            add_edge(comp_nid, js_nid, "references", _line(comp),
                      context="implemented_by", target_file=str(js_path))
 
         for child in comp:
@@ -570,14 +649,14 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
             tgt_path = _resolve_xios_uri(path, href, host_root)
             tgt_nid = _xios_file_nid(tgt_path, host_root)
             if ctag == "skin":
-                add_edge(comp_nid, tgt_nid, "references", 1,
+                add_edge(comp_nid, tgt_nid, "references", _line(child),
                          context="skinned_by", target_file=str(tgt_path))
             elif ctag == "style":
-                add_edge(comp_nid, tgt_nid, "references", 1,
+                add_edge(comp_nid, tgt_nid, "references", _line(child),
                          context="styled_by", target_file=str(tgt_path))
             elif ctag == "dependency":
                 sym = child.get("symbol", "")
-                add_edge(comp_nid, tgt_nid, "references", 1,
+                add_edge(comp_nid, tgt_nid, "references", _line(child),
                          context=f"depends_on({sym})" if sym else "depends_on",
                          target_file=str(tgt_path))
 
@@ -587,16 +666,16 @@ def _extract_system(path: Path, root: ET.Element, raw: bytes, host_root: Path | 
         if url and (url.startswith("host://") or url.endswith(".xml")):
             target_path = _resolve_xios_uri(path, url, host_root)
             target_nid = _xios_file_nid(target_path, host_root)
-            add_edge(file_nid, target_nid, "references", 1,
+            add_edge(file_nid, target_nid, "references", _line(el),
                      context="registers_app", target_file=str(target_path))
 
     # 4. Embedded process
     for proc in root.iter("process"):
         proc_name = proc.get("name", "systemProcess")
         proc_nid = _make_id(stem, "proc", proc_name)
-        add_node(proc_nid, proc_name, 1, node_kind="process",
+        add_node(proc_nid, proc_name, _line(proc), node_kind="process",
                  extra={"_xios_proc_name": proc_name, "_xios_stem": stem, "_xios_file": str_path})
-        add_edge(file_nid, proc_nid, "contains", 1)
+        add_edge(file_nid, proc_nid, "contains", _line(proc))
         _extract_process_body(path, proc, stem, str_path, proc_nid,
                               nodes, edges, seen_ids, None,
                               add_node=add_node, add_edge=add_edge,
@@ -645,7 +724,7 @@ def _extract_catalog(path: Path, root: ET.Element, raw: bytes, host_root: Path |
         if src_val:
             tgt_path = _resolve_xios_uri(path, src_val, host_root)
             tgt_nid = _xios_file_nid(tgt_path, host_root)
-            add_edge(file_nid, tgt_nid, "references", 1,
+            add_edge(file_nid, tgt_nid, "references", _line(src_el),
                      context=f"catalogs({name})" if name else "catalogs",
                      target_file=str(tgt_path))
 
@@ -700,8 +779,8 @@ def _extract_types(path: Path, root: ET.Element, raw: bytes) -> dict:
                 label = f"type:{name}"
                 if desc:
                     label += f" ({desc})"
-                add_node(type_nid, label, 1, node_kind="datatype", extra={"description": desc})
-                add_edge(file_nid, type_nid, "contains", 1)
+                add_node(type_nid, label, _line(type_el), node_kind="datatype", extra={"description": desc})
+                add_edge(file_nid, type_nid, "contains", _line(type_el))
 
     return {"nodes": nodes, "edges": edges}
 
@@ -755,15 +834,16 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
         label = comp_name
         if comp_tag:
             label = f"{comp_name} <{comp_tag}>"
-        add_node(comp_nid, label, 1, node_kind="component_definition",
+        line = _line(comp)
+        add_node(comp_nid, label, line, node_kind="component_definition",
                  extra={"tag": comp_tag, "class_name": comp_class, "_xios_comp_def": True})
-        add_edge(app_nid, comp_nid, "contains", 1, context="declares_component")
+        add_edge(app_nid, comp_nid, "contains", line, context="declares_component")
 
         # Link to implementation JS
         if comp_href:
             js_path = _resolve_xios_uri(path, comp_href, host_root)
             js_nid = _xios_file_nid(js_path, host_root)
-            add_edge(comp_nid, js_nid, "references", 1,
+            add_edge(comp_nid, js_nid, "references", line,
                      context="implemented_by", target_file=str(js_path))
 
         # Link to skin XSL
@@ -773,7 +853,7 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
                 if skin_href:
                     skin_path = _resolve_xios_uri(path, skin_href, host_root)
                     skin_nid = _xios_file_nid(skin_path, host_root)
-                    add_edge(comp_nid, skin_nid, "references", 1,
+                    add_edge(comp_nid, skin_nid, "references", _line(skin),
                      context="skinned_by", target_file=str(skin_path))
 
         # Link to style CSS
@@ -783,7 +863,7 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
                 if style_href:
                     style_path = _resolve_xios_uri(path, style_href, host_root)
                     style_nid = _xios_file_nid(style_path, host_root)
-                    add_edge(comp_nid, style_nid, "references", 1,
+                    add_edge(comp_nid, style_nid, "references", _line(style),
                      context="styled_by", target_file=str(style_path))
 
     # Resource declarations
@@ -793,15 +873,15 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
             res_name = res.get("name", "")
             if res_name:
                 res_nid = _make_id(stem, "res", res_name)
-                add_node(res_nid, f"#{res_name}", 1, node_kind="resource")
-                add_edge(app_nid, res_nid, "contains", 1, context="declares_resource")
+                add_node(res_nid, f"#{res_name}", _line(res), node_kind="resource")
+                add_edge(app_nid, res_nid, "contains", _line(res), context="declares_resource")
     for child in root:
         if _strip_ns(child.tag) == "item":
             res_name = child.get("name", "")
             if res_name:
                 res_nid = _make_id(stem, "res", res_name)
-                add_node(res_nid, f"#{res_name}", 1, node_kind="resource")
-                add_edge(app_nid, res_nid, "contains", 1, context="declares_resource")
+                add_node(res_nid, f"#{res_name}", _line(child), node_kind="resource")
+                add_edge(app_nid, res_nid, "contains", _line(child), context="declares_resource")
 
     # View declarations (both xlink mounts and inline views)
     for view_el in root.iter("view"):
@@ -809,18 +889,19 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
         v_href = _attr(view_el, "href", _XLINK_NS) or view_el.get("href", "")
         actuate = _attr(view_el, "actuate", _XLINK_NS) or "onRequest"
 
+        v_line = _line(view_el)
         if v_name:
             v_nid = _make_id(stem, "view", v_name)
-            add_node(v_nid, v_name, 1, node_kind="view",
+            add_node(v_nid, v_name, v_line, node_kind="view",
                      extra={"_xios_view_name": v_name, "_xios_stem": stem, "_xios_file": str_path})
-            add_edge(app_nid, v_nid, "contains", 1, context="declares_view")
+            add_edge(app_nid, v_nid, "contains", v_line, context="declares_view")
         else:
             v_nid = app_nid
 
         if v_href and v_href.endswith(".xml"):
             view_path = _resolve_xios_uri(path, v_href, host_root)
             view_nid = _xios_file_nid(view_path, host_root)
-            add_edge(v_nid, view_nid, "references", 1,
+            add_edge(v_nid, view_nid, "references", v_line,
                      context=f"mounts_view({actuate})",
                      target_file=str(view_path))
 
@@ -835,20 +916,20 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
                     child_path = _resolve_xios_uri(path, c_href, host_root)
                     child_nid = _xios_file_nid(child_path, host_root)
                     ctx = "mounts_view" if ext == ".xml" else ("skinned_by" if ext in (".xsl", ".xslt") else "imports_script")
-                    add_edge(v_nid, child_nid, "references", 1,
+                    add_edge(v_nid, child_nid, "references", _line(child),
                              context=ctx, target_file=str(child_path))
             c_name = child.get("name", "") or child.get("id", "")
             c_tag = _strip_ns(child.tag).lower()
             if c_name and c_tag not in ("view", "panel", "rule", "param", "method", "operation"):
                 comp_nid = _make_id(stem, c_tag, c_name)
-                add_node(comp_nid, f"{c_tag}:{c_name}", 1, node_kind="ui_element",
+                add_node(comp_nid, f"{c_tag}:{c_name}", _line(child), node_kind="ui_element",
                          extra={
                              "_xios_comp_name": c_name,
                              "_xios_view_name": v_name,
                              "_xios_view_nid": v_nid,
                              "_xios_tag": c_tag,
                          })
-                add_edge(v_nid, comp_nid, "contains", 1)
+                add_edge(v_nid, comp_nid, "contains", _line(child))
 
     # Process declarations (both xlink registrations and inline processes)
     for proc_el in root.iter("process"):
@@ -858,14 +939,14 @@ def _extract_manifest(path: Path, root: ET.Element, raw: bytes, host_root: Path 
             actuate = _attr(proc_el, "actuate", _XLINK_NS) or "onRequest"
             proc_path = _resolve_xios_uri(path, href, host_root)
             proc_nid = _xios_file_nid(proc_path, host_root)
-            add_edge(app_nid, proc_nid, "references", 1,
+            add_edge(app_nid, proc_nid, "references", _line(proc_el),
                      context=f"registers_process({actuate})",
                      target_file=str(proc_path))
         elif proc_name:
             inline_proc_nid = _make_id(stem, "proc", proc_name)
-            add_node(inline_proc_nid, proc_name, 1, node_kind="process",
+            add_node(inline_proc_nid, proc_name, _line(proc_el), node_kind="process",
                      extra={"_xios_proc_name": proc_name, "_xios_stem": stem, "_xios_file": str_path})
-            add_edge(app_nid, inline_proc_nid, "contains", 1, context="declares_process")
+            add_edge(app_nid, inline_proc_nid, "contains", _line(proc_el), context="declares_process")
             _extract_process_body(path, proc_el, stem, str_path, inline_proc_nid,
                                   nodes, edges, seen_ids, lines=None,
                                   add_node=add_node, add_edge=add_edge,
@@ -934,26 +1015,13 @@ def _extract_process_body(path: Path, root: ET.Element, stem: str, str_path: str
                           host_root: Path | None = None) -> None:
     """Extract operations, triggers, steps, and flows for a process."""
 
-    def _approx_line(el: ET.Element, attr_hint: str = "") -> int:
-        if not lines:
-            return 1
-        tag = _strip_ns(el.tag)
-        hint = attr_hint or el.get("id", "") or el.get("name", "") or tag
-        for i, line in enumerate(lines, 1):
-            if hint and hint in line and f"<{tag}" in line.lower():
-                return i
-        for i, line in enumerate(lines, 1):
-            if hint and hint in line:
-                return i
-        return 1
-
     # Extract script href imports
     for sc in root.iter("script"):
         s_href = _attr(sc, "href", _XLINK_NS) or sc.get("href", "")
         if s_href and not s_href.startswith("http"):
             s_path = _resolve_xios_uri(path, s_href, host_root)
             s_nid = _xios_file_nid(s_path, host_root)
-            add_edge(proc_nid, s_nid, "imports", 1,
+            add_edge(proc_nid, s_nid, "imports", _line(sc),
                      context="imports_script", target_file=str(s_path))
 
     # Custom operations declared with href at process level
@@ -963,7 +1031,7 @@ def _extract_process_body(path: Path, root: ET.Element, stem: str, str_path: str
             op_name = op_el.get("name", "")
             op_path = _resolve_xios_uri(path, op_href, host_root)
             op_nid = _xios_file_nid(op_path, host_root)
-            add_edge(proc_nid, op_nid, "imports", 1,
+            add_edge(proc_nid, op_nid, "imports", _line(op_el),
                      context=f"declares_operation({op_name})" if op_name else "declares_operation",
                      target_file=str(op_path))
 
@@ -974,7 +1042,7 @@ def _extract_process_body(path: Path, root: ET.Element, stem: str, str_path: str
         t_event = trigger.get("event", "")
         t_step = trigger.get("step", "")
         t_comm = trigger.get("communicator", "")
-        line = _approx_line(trigger, t_step or t_event)
+        line = _line(trigger)
 
         label_parts = []
         if t_view:
@@ -1013,7 +1081,7 @@ def _extract_process_body(path: Path, root: ET.Element, stem: str, str_path: str
             continue
 
         step_nid = _make_id(stem, "step", step_id)
-        line = _approx_line(step_el, step_id)
+        line = _line(step_el)
         add_node(step_nid, f"{step_id}: {step_name}", line, node_kind="step",
                  extra={"_xios_step_id": step_id, "_xios_proc_nid": proc_nid})
         add_edge(proc_nid, step_nid, "contains", line)
@@ -1035,18 +1103,10 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
                            host_root: Path | None = None):
     """Extract operation references inside a step."""
 
-    def _approx_line_op(hint: str) -> int:
-        if not lines:
-            return 1
-        for i, line in enumerate(lines, 1):
-            if hint and hint in line:
-                return i
-        return 1
-
     for op in step_el.iter("operation"):
         op_name = op.get("name", "")
         op_value = op.get("value", "")
-        line = _approx_line_op(op_name or op_value or "operation")
+        line = _line(op)
 
         if op_name == "call":
             # Calls another step
@@ -1085,6 +1145,11 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
             # Opens a view or process
             if op_value:
                 clean_val = op_value.strip()
+                target_path = None
+                ctx = "opens_view"
+                if clean_val.endswith(".xml") or clean_val.startswith("host://") or clean_val.startswith("xios://"):
+                    target_path = _resolve_xios_uri(file_path, clean_val, host_root)
+                    ctx = _opens_context(target_path)
                 open_nid = _make_id(stem, "open", clean_val.replace("://", "_").replace("/", "_").replace("#", "_"))
                 add_node(open_nid, f"open({clean_val})", line, node_kind="view_action",
                          extra={
@@ -1093,13 +1158,12 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
                              "_xios_step_nid": step_nid,
                              "_xios_proc_nid": proc_nid,
                          })
-                add_edge(step_nid, open_nid, "references", line, context="opens_view")
+                add_edge(step_nid, open_nid, "references", line, context=ctx)
 
-                if clean_val.endswith(".xml") or clean_val.startswith("host://") or clean_val.startswith("xios://"):
-                    view_path = _resolve_xios_uri(file_path, clean_val, host_root)
-                    view_nid = _xios_file_nid(view_path, host_root)
-                    add_edge(step_nid, view_nid, "references", line,
-                             context="opens_view", target_file=str(view_path))
+                if target_path is not None:
+                    target_nid = _xios_file_nid(target_path, host_root)
+                    add_edge(step_nid, target_nid, "references", line,
+                             context=ctx, target_file=str(target_path))
 
         elif op_name == "close":
             # Closes a view
@@ -1191,7 +1255,7 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
                 when_step = when.get("step", "")
                 if when_step:
                     target_nid = _make_id(stem, "step", when_step)
-                    add_edge(step_nid, target_nid, "calls", line,
+                    add_edge(step_nid, target_nid, "calls", _line(when),
                              context="decision_branch")
 
         elif op_name == "setSelection":
@@ -1223,7 +1287,7 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
         if tf and (tf.startswith("host://") or tf.startswith("xios://") or tf.endswith(".xslt") or tf.endswith(".xsl")):
             tf_path = _resolve_xios_uri(file_path, tf, host_root)
             tf_nid = _xios_file_nid(tf_path, host_root)
-            add_edge(step_nid, tf_nid, "references", 1, context="transforms_with", target_file=str(tf_path))
+            add_edge(step_nid, tf_nid, "references", _line(store_el), context="transforms_with", target_file=str(tf_path))
 
     # Aliases (process variable assignments referencing views/resources)
     for alias_el in step_el.iter("alias"):
@@ -1231,7 +1295,7 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
         refs = re.findall(r'#(\w+)#(\w+)', alias_value)
         for view_name, comp_name in refs:
             ref_nid = _make_id(stem, "ref", view_name, comp_name)
-            add_node(ref_nid, f"#{view_name}#{comp_name}", 1,
+            add_node(ref_nid, f"#{view_name}#{comp_name}", _line(alias_el),
                      node_kind="component_reference",
                      extra={
                          "_xios_op": "alias",
@@ -1240,21 +1304,21 @@ def _walk_step_operations(step_el, step_nid, proc_nid, stem, str_path, file_path
                          "_xios_step_nid": step_nid,
                          "_xios_proc_nid": proc_nid,
                      })
-            add_edge(step_nid, ref_nid, "references", 1,
+            add_edge(step_nid, ref_nid, "references", _line(alias_el),
                      context="alias_reads_component",
                      confidence="INFERRED")
         m_uri = re.search(r'(?:host|xios)://[^\s\}\"\']+', alias_value)
         if m_uri:
             a_path = _resolve_xios_uri(file_path, m_uri.group(0), host_root)
             a_nid = _xios_file_nid(a_path, host_root)
-            add_edge(step_nid, a_nid, "references", 1, context="alias_resource", target_file=str(a_path))
+            add_edge(step_nid, a_nid, "references", _line(alias_el), context="alias_resource", target_file=str(a_path))
 
     # Listen elements (event listeners on data documents)
     for listen_el in step_el.iter("listen"):
         listen_step = listen_el.get("step", "")
         if listen_step:
             target_nid = _make_id(stem, "step", listen_step)
-            add_edge(step_nid, target_nid, "calls", 1,
+            add_edge(step_nid, target_nid, "calls", _line(listen_el),
                      context="listen_fires_step")
 
 
@@ -1268,12 +1332,6 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
     seen_ids: set[str] = set()
 
     lines = raw.decode("utf-8", errors="replace").splitlines()
-
-    def _approx_line(hint: str) -> int:
-        for i, line in enumerate(lines, 1):
-            if hint and hint in line:
-                return i
-        return 1
 
     def add_node(nid, label, line, file_type="code", node_kind="component", extra=None):
         if nid and nid not in seen_ids:
@@ -1316,7 +1374,7 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
         if s_href and not s_href.startswith("http"):
             s_path = _resolve_xios_uri(path, s_href, host_root)
             s_nid = _xios_file_nid(s_path, host_root)
-            line = _approx_line(s_href)
+            line = _line(sc)
             add_edge(view_nid, s_nid, "imports", line,
                      context="imports_script", target_file=str(s_path))
 
@@ -1327,7 +1385,7 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
             tag = _strip_ns(child.tag).lower()
             name = child.get("name", "") or child.get("id", "")
             if not name and tag in _CUSTOM_TAGS:
-                name = child.get("pipeline", "") or child.get("diagram", "") or child.get("plotly", "") or f"{tag}_{_approx_line(tag)}"
+                name = child.get("pipeline", "") or child.get("diagram", "") or child.get("plotly", "") or f"{tag}_{_line(child)}"
 
             # Check for xlink / href / source embedded references
             sub_href = _attr(child, "href", _XLINK_NS) or child.get("href", "") or child.get("source", "")
@@ -1336,7 +1394,7 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
                 if clean_ext in (".xml", ".xsl", ".xslt", ".js"):
                     sub_path = _resolve_xios_uri(path, sub_href, host_root)
                     sub_nid = _xios_file_nid(sub_path, host_root)
-                    line = _approx_line(sub_href)
+                    line = _line(child)
                     ctx = "embeds_view" if clean_ext == ".xml" else ("skinned_by" if clean_ext in (".xsl", ".xslt") else "imports_script")
                     rel = "imports" if clean_ext == ".js" else "references"
                     add_edge(view_nid, sub_nid, rel, line,
@@ -1350,7 +1408,7 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
                 nested_name = child.get("name", "") or child.get("id", "")
                 if nested_name:
                     nested_nid = _make_id(stem, "view", nested_name)
-                    line = _approx_line(nested_name)
+                    line = _line(child)
                     add_node(nested_nid, nested_name, line, node_kind="view",
                              extra={"_xios_view_name": nested_name, "_xios_stem": stem, "_xios_file": str_path})
                     add_edge(parent_nid, nested_nid, "contains", line)
@@ -1358,7 +1416,7 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
                 else:
                     walk_view(child, parent_nid, depth + 1)
             elif name and tag not in _NON_COMPONENT_TAGS:
-                line = _approx_line(name)
+                line = _line(child)
                 comp_nid = _make_id(stem, tag, name)
                 is_custom = tag in _CUSTOM_TAGS
                 comp_label = f"{name}" if is_custom else f"{tag}:{name}"
@@ -1390,6 +1448,56 @@ def _extract_view(path: Path, root: ET.Element, raw: bytes, host_root: Path | No
 
 
 # ── Cross-File Resolution ───────────────────────────────────────────────────
+
+_BOOT_VAR_RE = re.compile(r"\bvar\s+boot\s*=")
+_BOOT_SCRIPT_RE = re.compile(
+    r"<script\b[^>]*\bsrc\s*=\s*[\"']([^\"']*\bboot\.js)(?:\?[^\"']*)?[\"']", re.IGNORECASE)
+
+
+def _link_xios_boot_pages(host_root: Path, all_nodes: list[dict],
+                          node_by_id: dict[str, dict], add_edge: Callable) -> None:
+    """Add page --references(boots_xios)--> boot.js for every HTML page that boots XIOS.
+
+    Candidates are the HTML files already in the graph plus top-level host pages.
+    """
+    pages: dict[str, Path] = {}
+    for n in all_nodes:
+        sf = n.get("source_file") or ""
+        if sf.lower().endswith((".html", ".htm")):
+            p = Path(sf) if Path(sf).is_absolute() else host_root / sf
+            pages.setdefault(os.path.normcase(str(p)), p)
+    try:
+        for p in host_root.glob("*.htm*"):
+            pages.setdefault(os.path.normcase(str(p)), p)
+    except OSError:
+        pass
+
+    for page in pages.values():
+        try:
+            text = page.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m_var = _BOOT_VAR_RE.search(text)
+        m_src = _BOOT_SCRIPT_RE.search(text)
+        if not (m_var and m_src):
+            continue
+        page_nid = _xios_file_nid(page, host_root)
+        if page_nid not in node_by_id:
+            p_node = {"id": page_nid, "label": page.name, "file_type": "code",
+                      "node_kind": "file", "source_file": str(page), "source_location": "L1"}
+            node_by_id[page_nid] = p_node
+            all_nodes.append(p_node)
+        boot_path = _resolve_xios_uri(page, m_src.group(1), host_root)
+        boot_nid = _xios_file_nid(boot_path, host_root)
+        if boot_nid not in node_by_id:
+            b_node = {"id": boot_nid, "label": boot_path.name, "file_type": "code",
+                      "node_kind": "file", "source_file": str(boot_path), "source_location": "L1"}
+            node_by_id[boot_nid] = b_node
+            all_nodes.append(b_node)
+        line = text.count("\n", 0, m_var.start()) + 1
+        add_edge(page_nid, boot_nid, "references", line=line, context="boots_xios",
+                 source_file=str(page), target_file=str(boot_path))
+
 
 def resolve_xios_view_process_links(
     _per_file: list[dict], all_nodes: list[dict], all_edges: list[dict]
@@ -1580,6 +1688,12 @@ def resolve_xios_view_process_links(
                                      context="styled_by", source_file=str(index_file),
                                      target_file=str(style_path))
 
+    # Pages that boot XIOS: an inline `var boot = {...}` plus a <script src=".../xios/boot.js">.
+    # Deterministic, so "which pages boot XIOS" does not depend on the semantic pass
+    # happening to notice every entry page.
+    if host_root is not None:
+        _link_xios_boot_pages(host_root, all_nodes, node_by_id, add_edge)
+
     # Published application package linking
     if host_root and (host_root / "published" / "index.html").is_file():
         pub_idx_file = host_root / "published" / "index.html"
@@ -1637,9 +1751,45 @@ def resolve_xios_view_process_links(
         if "mounts_view" in ctx or "embeds_view" in ctx:
             manifest_mounts.setdefault(e["source"], []).append(e["target"])
 
-    def resolve_view(target_str: str) -> list[str]:
+    def _norm_path(p: str | Path) -> str:
+        try:
+            p = Path(p).resolve()
+        except (OSError, RuntimeError):
+            p = Path(p)
+        return os.path.normcase(os.path.normpath(str(p)))
+
+    views_by_path: dict[str, str] = {}
+    for sf, v_nid in views_by_source_file.items():
+        views_by_path.setdefault(_norm_path(sf), v_nid)
+
+    def _is_path_target(target_str: str) -> bool:
+        t = target_str.strip()
+        return "://" in t or "/" in t or "\\" in t or t.lower().endswith(".xml")
+
+    def resolve_by_path(target_str: str, base_file: str | None,
+                        index: dict[str, str]) -> list[str]:
+        """Resolve a URI/path target by its full normalized path — never by file stem.
+
+        Several files can share a name (service/dashboard.xml, service/processes/dashboard.xml,
+        service/views/dashboard.xml), so a stem match would link to the wrong document.
+        """
+        clean = target_str.strip().lstrip("#")
+        if base_file:
+            resolved = _resolve_xios_uri(Path(base_file), clean, host_root)
+            hit = index.get(_norm_path(resolved))
+            return [hit] if hit else []
+        # No base file: accept only an unambiguous suffix match on a path boundary.
+        rel = re.sub(r'^(host|xios)://', '', clean).lstrip('/\\')
+        rel_norm = os.path.normcase(os.path.normpath(rel))
+        hits = [nid for p, nid in index.items()
+                if p == rel_norm or p.endswith(os.sep + rel_norm)]
+        return hits if len(hits) == 1 else []
+
+    def resolve_view(target_str: str, base_file: str | None = None) -> list[str]:
         if not target_str:
             return []
+        if _is_path_target(target_str):
+            return resolve_by_path(target_str, base_file, views_by_path)
         clean = target_str.strip("#").strip()
         clean = re.sub(r'^(host|xios)://', '', clean).lstrip('/\\')
         clean_norm = os.path.normpath(clean).replace('\\', '/').lower()
@@ -1746,6 +1896,17 @@ def resolve_xios_view_process_links(
             if stem:
                 procs_by_stem[stem.lower()] = nid
 
+    # Only a file whose root is <process> can be the target of open(path); inline
+    # processes inside manifests or system files share their host file's path.
+    procs_by_path: dict[str, str] = {}
+    for sfile, nid in procs_by_source_file.items():
+        if _xios_doc_kind(Path(sfile)) == "process":
+            procs_by_path.setdefault(_norm_path(sfile), nid)
+
+    def _line_of(node: dict) -> int:
+        m = re.match(r"L(\d+)", node.get("source_location") or "")
+        return int(m.group(1)) if m else 1
+
     # Find step -> proc and trigger -> proc
     step_to_proc: dict[str, str] = {}
     trigger_to_proc: dict[str, str] = {}
@@ -1796,19 +1957,19 @@ def resolve_xios_view_process_links(
 
             v_nids = resolve_view(t_view) if t_view else []
             for vn in v_nids:
-                add_edge(trig_nid, vn, "references", context="listens_to", weight=0.8)
+                add_edge(trig_nid, vn, "references", line=_line_of(n), context="listens_to", weight=0.8)
                 if proc_nid:
-                    add_edge(proc_nid, vn, "references", context="operates_on", weight=0.8)
+                    add_edge(proc_nid, vn, "references", line=_line_of(n), context="operates_on", weight=0.8)
                 if not t_comp:
-                    add_edge(vn, trig_nid, "calls", context="fires_trigger", weight=1.0)
+                    add_edge(vn, trig_nid, "calls", line=_line_of(n), context="fires_trigger", weight=1.0)
 
             if t_comp:
                 c_nid = resolve_comp(t_view, t_comp)
                 if c_nid:
-                    add_edge(c_nid, trig_nid, "calls", context="fires_trigger", weight=1.0)
-                    add_edge(trig_nid, c_nid, "references", context="triggers_on", weight=0.8)
+                    add_edge(c_nid, trig_nid, "calls", line=_line_of(n), context="fires_trigger", weight=1.0)
+                    add_edge(trig_nid, c_nid, "references", line=_line_of(n), context="triggers_on", weight=0.8)
                     if proc_nid:
-                        add_edge(proc_nid, c_nid, "references", context="handles_component", weight=0.8)
+                        add_edge(proc_nid, c_nid, "references", line=_line_of(n), context="handles_component", weight=0.8)
 
     # 5. Connect Operations
     for n in all_nodes:
@@ -1831,9 +1992,9 @@ def resolve_xios_view_process_links(
                     v_name, c_name, act = m.group(1), m.group(2), m.group(3)
             c_nid = resolve_comp(v_name, c_name)
             if c_nid:
-                add_edge(nid, c_nid, "references", context="targets_component", weight=0.8)
+                add_edge(nid, c_nid, "references", line=_line_of(n), context="targets_component", weight=0.8)
                 if step_nid:
-                    add_edge(step_nid, c_nid, "calls", context=f"ui_action:{act}", weight=1.0)
+                    add_edge(step_nid, c_nid, "calls", line=_line_of(n), context=f"ui_action:{act}", weight=1.0)
 
         elif nkind == "method_call" or n.get("_xios_op") == "callMethod":
             v_name = n.get("_xios_call_view")
@@ -1846,18 +2007,18 @@ def resolve_xios_view_process_links(
                     method = m.group(3) or ""
             c_nid = resolve_comp(v_name, c_name)
             if c_nid:
-                add_edge(nid, c_nid, "references", context="targets_component", weight=0.8)
+                add_edge(nid, c_nid, "references", line=_line_of(n), context="targets_component", weight=0.8)
                 if step_nid:
-                    add_edge(step_nid, c_nid, "calls", context=f"callMethod:{method}", weight=1.0)
+                    add_edge(step_nid, c_nid, "calls", line=_line_of(n), context=f"callMethod:{method}", weight=1.0)
 
         elif nkind == "data_binding" or n.get("_xios_op") == "bind":
             bind_comps = n.get("_xios_bind_comps", [])
             for c_view, c_name in bind_comps:
                 c_nid = resolve_comp(c_view, c_name)
                 if c_nid:
-                    add_edge(nid, c_nid, "references", context="targets_component", weight=0.8)
+                    add_edge(nid, c_nid, "references", line=_line_of(n), context="targets_component", weight=0.8)
                     if step_nid:
-                        add_edge(step_nid, c_nid, "references", context="binds_data", weight=0.8)
+                        add_edge(step_nid, c_nid, "references", line=_line_of(n), context="binds_data", weight=0.8)
 
         elif nkind == "component_reference" or n.get("_xios_op") == "alias":
             v_name = n.get("_xios_ref_view")
@@ -1868,9 +2029,9 @@ def resolve_xios_view_process_links(
                     v_name, c_name = m.group(1), m.group(2)
             c_nid = resolve_comp(v_name, c_name)
             if c_nid:
-                add_edge(nid, c_nid, "references", context="targets_component", weight=0.8)
+                add_edge(nid, c_nid, "references", line=_line_of(n), context="targets_component", weight=0.8)
                 if step_nid:
-                    add_edge(step_nid, c_nid, "references", context="alias_reads_component", weight=0.8)
+                    add_edge(step_nid, c_nid, "references", line=_line_of(n), context="alias_reads_component", weight=0.8)
 
         elif nkind == "view_action" or n.get("_xios_op") in ("open", "close"):
             op_kind = n.get("_xios_op")
@@ -1883,22 +2044,28 @@ def resolve_xios_view_process_links(
             if not op_kind:
                 op_kind = "open" if "open(" in n.get("label", "") else "close"
 
-            v_nids = resolve_view(target) if target else []
+            op_file = n.get("source_file") or None
+            op_line = _line_of(n)
+            v_nids = resolve_view(target, op_file) if target else []
             for vn in v_nids:
-                add_edge(nid, vn, "references", context=f"{op_kind}s_view", weight=0.8)
+                add_edge(nid, vn, "references", line=op_line, context=f"{op_kind}s_view", weight=0.8)
                 if step_nid:
-                    add_edge(step_nid, vn, "calls", context=f"{op_kind}s_view", weight=1.0)
+                    add_edge(step_nid, vn, "calls", line=op_line, context=f"{op_kind}s_view", weight=1.0)
                 if proc_nid:
-                    add_edge(proc_nid, vn, "references", context=f"{op_kind}s_view", weight=0.8)
+                    add_edge(proc_nid, vn, "references", line=op_line, context=f"{op_kind}s_view", weight=0.8)
 
             if target and not v_nids:
                 clean_target = target.strip("#").strip()
-                p_stem = Path(clean_target).stem.lower()
-                target_proc = procs_by_stem.get(p_stem) or procs_by_name.get(clean_target.lower())
+                if _is_path_target(clean_target):
+                    hits = resolve_by_path(clean_target, op_file, procs_by_path)
+                    target_proc = hits[0] if hits else None
+                else:
+                    target_proc = (procs_by_stem.get(Path(clean_target).stem.lower())
+                                   or procs_by_name.get(clean_target.lower()))
                 if target_proc:
-                    add_edge(nid, target_proc, "references", context=f"{op_kind}s_process", weight=0.8)
+                    add_edge(nid, target_proc, "references", line=op_line, context=f"{op_kind}s_process", weight=0.8)
                     if step_nid:
-                        add_edge(step_nid, target_proc, "calls", context=f"{op_kind}s_process", weight=1.0)
+                        add_edge(step_nid, target_proc, "calls", line=op_line, context=f"{op_kind}s_process", weight=1.0)
 
     # 6. Map custom components in views to their definitions and implementations
     for e in all_edges:

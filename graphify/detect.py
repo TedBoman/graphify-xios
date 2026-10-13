@@ -996,6 +996,77 @@ _GRAPHIFY_INSTALLED_FILES = frozenset({
 })
 
 
+_MINIFIED_SUFFIXES = (".min.js", ".min.mjs", ".min.cjs")
+_MINIFIED_SNIFF_BYTES = 64 * 1024
+_MINIFIED_MIN_BYTES = 20 * 1024
+_MINIFIED_AVG_LINE = 300
+
+
+def _is_minified_bundle(path: Path) -> bool:
+    """True for a minified JS bundle (``*.min.js`` or a large file of very long lines).
+
+    Their AST is hundreds of one-letter functions (``a()``, ``b()``, ``aa()``) that
+    only add noise to queries and communities. Set GRAPHIFY_INCLUDE_MINIFIED=1 to
+    keep them.
+    """
+    if os.environ.get("GRAPHIFY_INCLUDE_MINIFIED") == "1":
+        return False
+    name = path.name.lower()
+    if name.endswith(_MINIFIED_SUFFIXES):
+        return True
+    if path.suffix.lower() not in (".js", ".mjs", ".cjs"):
+        return False
+    try:
+        if path.stat().st_size < _MINIFIED_MIN_BYTES:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(_MINIFIED_SNIFF_BYTES)
+    except OSError:
+        return False
+    lines = head.count(b"\n") + 1
+    return len(head) / lines > _MINIFIED_AVG_LINE
+
+
+_ICON_DIR_NAMES = frozenset({"icons", "icon", "glyphs", "sprites", "emoji", "emojis"})
+_ICON_DIR_MIN_SVGS = 25
+_ICON_MAX_BYTES = 8 * 1024
+
+
+def _icon_asset_dirs(images: list[str]) -> set[str]:
+    """Directories whose images are icon assets rather than a semantic corpus.
+
+    A directory qualifies when it holds mostly small SVGs: either it has an icon-ish
+    name (icons/, glyphs/, sprites/ ...) or it holds at least _ICON_DIR_MIN_SVGS
+    SVGs that are 80%+ of its images with a median size under _ICON_MAX_BYTES.
+    Each image would otherwise cost a vision agent. Set
+    GRAPHIFY_INCLUDE_ICON_ASSETS=1 to keep them.
+    """
+    if os.environ.get("GRAPHIFY_INCLUDE_ICON_ASSETS") == "1":
+        return set()
+    by_dir: dict[str, list[str]] = {}
+    for img in images:
+        by_dir.setdefault(os.path.dirname(img), []).append(img)
+    asset_dirs: set[str] = set()
+    for d, imgs in by_dir.items():
+        svgs = [i for i in imgs if i.lower().endswith(".svg")]
+        if not svgs or len(svgs) / len(imgs) < 0.8:
+            continue
+        sizes = []
+        for s in svgs:
+            try:
+                sizes.append(os.path.getsize(s))
+            except OSError:
+                pass
+        if not sizes:
+            continue
+        sizes.sort()
+        small = sizes[len(sizes) // 2] <= _ICON_MAX_BYTES
+        named = os.path.basename(d).lower() in _ICON_DIR_NAMES
+        if small and (named or len(svgs) >= _ICON_DIR_MIN_SVGS):
+            asset_dirs.add(d)
+    return asset_dirs
+
+
 def _is_installed_graphify_file(path: "Path") -> bool:
     """True for a single file `graphify install` wrote into the project (#4057)."""
     return path.parts[-3:] in _GRAPHIFY_INSTALLED_FILES
@@ -1928,6 +1999,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         return _cache.cached_word_count(path, root, count_words, cache_root=cache_root)
 
     skipped_sensitive: list[str] = []
+    skipped_generated: list[str] = []
     unclassified: list[str] = []
     # Files/dirs dropped by a .gitignore/.graphifyignore rule. Recorded so an
     # over-broad ignore (or a legitimately-ignored subtree) is visible instead
@@ -2108,6 +2180,9 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         if _is_sensitive(p):
             skipped_sensitive.append(str(p))
             continue
+        if _is_minified_bundle(p):
+            skipped_generated.append(str(p) + " [minified bundle]")
+            continue
         ftype = classify_file(p)
         if not ftype:
             # Considered but unclassifiable: an extension not in any supported set,
@@ -2165,6 +2240,16 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             if ftype != FileType.VIDEO:
                 total_words += _wc(p)
 
+    asset_dirs = _icon_asset_dirs(files[FileType.IMAGE])
+    if asset_dirs:
+        kept_images = []
+        for img in files[FileType.IMAGE]:
+            if os.path.dirname(img) in asset_dirs:
+                skipped_generated.append(img + " [icon asset]")
+            else:
+                kept_images.append(img)
+        files[FileType.IMAGE] = kept_images
+
     for ftype in files:
         files[ftype].sort()
 
@@ -2192,6 +2277,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         "needs_graph": needs_graph,
         "warning": warning,
         "skipped_sensitive": skipped_sensitive,
+        "skipped_generated": sorted(skipped_generated),
         "unclassified": sorted(unclassified),
         "walk_errors": walk_errors,
         "ignored": sorted(ignored),
