@@ -109,6 +109,14 @@ _GRAPH_DIFF_EDIT = (
     " to it in a pull request is expected. Do not flag it as churn or suggest skipping the"
     " graph rebuild or its hooks.",
 )
+_QUERY_RULE = (
+    '- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.'
+)
+_TOKEN_GUARD_EDIT = (
+    _QUERY_RULE,
+    _QUERY_RULE
+    + "\n- Never read `graphify-out/graph.json` or `graphify-out/GRAPH_REPORT.md` directly into context with Read/cat/head — they are multi-megabyte files that consume tens of thousands of tokens. Always query via `graphify query`, `graphify path`, or `graphify explain`.",
+)
 ALWAYS_ON_SANCTIONED_EDITS: dict[str, tuple[tuple[str, str], ...]] = {
     # #1530: install guidance must stay host-generic — do not tell agents to
     # invoke a literal `skill` tool with `skill: "graphify"`, which is
@@ -122,9 +130,10 @@ ALWAYS_ON_SANCTIONED_EDITS: dict[str, tuple[tuple[str, str], ...]] = {
         ),
         _GRAPH_DIFF_EDIT,
     ),
-    "_CLAUDE_MD_SECTION": (_GRAPH_DIFF_EDIT,),
+    "_CLAUDE_MD_SECTION": (_TOKEN_GUARD_EDIT, _GRAPH_DIFF_EDIT),
     "_GEMINI_MD_SECTION": (_GRAPH_DIFF_EDIT,),
 }
+
 
 # The full six-value file_type enum (Decision A). Every rendered platform — split
 # or monolith — must carry exactly this enum, byte for byte. schema-singleton
